@@ -1,6 +1,6 @@
 # RFC: Log Alarm L2 Construct
 
-* **Original Author(s):** @rtuna
+* **Original Author(s):** @rodrigotuna
 * **Tracking Issue:** https://github.com/aws/aws-cdk-rfcs/issues/960
 * **API Bar Raiser:** TBD
 
@@ -47,7 +47,7 @@ new cloudwatch.LogAlarm(this, 'ErrorRateAlarm', {
   scheduledQueryConfiguration: {
     queryString: 'fields @message | filter @message like /ERROR/',
     aggregationExpression: 'count(*)',
-    logGroupIdentifiers: [logGroup.logGroupName],
+    logGroups: [logGroup],
     scheduledQueryRole: queryRole,
     schedule: {
       rate: Duration.minutes(5),
@@ -59,8 +59,8 @@ new cloudwatch.LogAlarm(this, 'ErrorRateAlarm', {
 
 ##### Including Log Lines in Notifications
 
-Set `actionLogLineCount` to include matching log lines in alarm notifications. When it is greater than 0, an
-`actionLogLineRole` is required so CloudWatch can read the log lines.
+Set `actionLogLineCount` to include matching log lines in alarm notifications. When it is greater than 0, a role that
+lets CloudWatch read the log lines is auto-created; pass `actionLogLineRole` to supply your own instead.
 
 ```ts
 new cloudwatch.LogAlarm(this, 'ErrorRateAlarm', {
@@ -177,10 +177,17 @@ It maps to the `AWS::CloudWatch::LogAlarm` resource (a distinct resource type, u
   minutes ≥ 1 (validated at synth); `startTimeOffset`/`endTimeOffset` convert to the integer seconds the L1 expects.
 - **`startTimeOffset` is required** — the scheduled-query service rejects a null start-time offset, so requiring it fails
   fast at synth instead of at deploy (per the guideline on synth-time validation of always-fail-at-deploy input).
-- **`logGroupIdentifiers: string[]` (not `ILogGroup[]`)** — `aws-logs` already depends on `aws-cloudwatch`, so importing
-  `ILogGroup` into `aws-cloudwatch` would create a circular module dependency and break the jsii build (which is why no
-  `aws-cloudwatch` construct references `aws-logs`). `string[]` also matches how CWLI `SOURCE`-prefix queries identify log
-  groups.
+- **`logGroups: ILogGroupRef[]` (not `ILogGroup[]`, not `string[]`)** — `ILogGroup` itself cannot be used: `aws-logs`
+  already depends on `aws-cloudwatch`, so importing it would create a circular module dependency and break the jsii
+  build. `ILogGroupRef`, however, lives in the shared generated interface layer
+  (`aws-cdk-lib/interfaces/generated/aws-logs-interfaces.generated`), which exists precisely to be importable from any
+  module without introducing a cycle; `aws-cloudwatch` already imports `IAlarmRef` from that same layer, and
+  `ILogGroupRef` is consumed cross-module today by `aws-ec2`, `aws-events-targets`, and `custom-resources`. Taking the
+  typed reference lets callers pass `LogGroup` constructs directly instead of hand-extracting names, and imported log
+  groups remain expressible via `LogGroup.fromLogGroupName()` / `fromLogGroupArn()`. A `string | ILogGroupRef` union was
+  rejected because jsii does not support union types. The construct renders `logGroupRef.logGroupName` into the L1's
+  `LogGroupIdentifiers`, because the scheduled-query service rejects log group ARNs carrying the trailing `:*` that
+  `logGroupArn` includes.
 
 A proof-of-concept construct with unit tests and an integration test has been implemented and deployed against a real
 account, confirming it creates a valid `AWS::CloudWatch::LogAlarm`.
@@ -201,7 +208,7 @@ No. This is a new construct; it does not alter any existing API.
 ### What are the drawbacks of this solution?
 
 The construct depends on the `AWS::CloudWatch::LogAlarm` schema published in `@aws-cdk/aws-service-spec`. The field
-constraints are final (`logGroupIdentifiers` optional, `startTimeOffset` range fixed); the L2 is written against that
+constraints are final (`LogGroupIdentifiers` optional, `startTimeOffset` range fixed); the L2 is written against that
 final shape and requires the corresponding published service-spec version at build time.
 
 ### What is the high-level project plan?
@@ -227,7 +234,7 @@ final shape and requires the corresponding published service-spec version at bui
 export interface LogAlarmProps {
   readonly threshold: number;
   readonly comparisonOperator: ComparisonOperator;       // static-threshold operators only
-  readonly queryResultsToEvaluate: number;               // N (positive integer)
+  readonly queryResultsToEvaluate: number;               // N (integer 1-100)
   readonly queryResultsToAlarm: number;                  // M (positive integer, ≤ N)
   readonly scheduledQueryConfiguration: ScheduledQueryConfiguration;
 
@@ -246,7 +253,7 @@ export interface LogAlarmProps {
 export interface ScheduledQueryConfiguration {
   readonly queryString: string;
   readonly aggregationExpression: string;                // e.g. count(*)
-  readonly logGroupIdentifiers?: string[];               // names or ARNs; optional for inline CWLI SOURCE queries
+  readonly logGroups?: ILogGroupRef[];                   // optional for inline CWLI SOURCE queries
   readonly scheduledQueryRole?: IRole;                   // auto-created (trusts logs.amazonaws.com) when omitted
   readonly schedule: ScheduledQuerySchedule;
 }
@@ -276,15 +283,50 @@ export class LogAlarm extends AlarmBase {
 }
 ```
 
+#### IAM role behaviour
+
+The construct **creates** a role when one is not supplied, and **never modifies a role that the caller supplies**:
+
+- `scheduledQueryConfiguration.scheduledQueryRole` omitted → a role trusting `logs.amazonaws.com` is created, scoped
+  with `aws:SourceAccount` / `aws:SourceArn` confused-deputy conditions and granted `logs:StartQuery`,
+  `logs:StopQuery`, `logs:GetQueryResults`, and `logs:DescribeLogGroups`.
+- `actionLogLineRole` omitted while `actionLogLineCount > 0` → a role trusting `cloudwatch.amazonaws.com` is created
+  with the same confused-deputy conditions and granted `logs:GetQueryResults`.
+- Either role **supplied** by the caller → used verbatim. The construct adds no trust statements and no permissions to
+  it.
+
+Not mutating a supplied role is deliberate. Silently broadening a role the customer owns and reviews is surprising, can
+defeat a deliberately narrow scope, and makes the effective permissions of a role invisible in the code that defines it.
+Consistent with the rest of CDK, permissions are added to a caller-supplied role only when the caller asks — both roles
+are exposed as public readonly properties, so `alarm.scheduledQueryRole.addToPrincipalPolicy(...)` and the usual grant
+helpers remain available. The trade-off is that a caller who supplies an under-permissioned role gets a runtime failure
+(the scheduled query reports `executionStatus: Failed`, and the alarm reports `EvaluationState: EVALUATION_ERROR`)
+rather than a synth error; the permissions a supplied role needs are listed above, and the auto-created path is the
+default.
+
+For the same reason the construct does **not** offer an `addLogGroup()` helper: without role mutation it could only
+append to `LogGroupIdentifiers` without granting query access to the added log group, which is precisely the
+silent-failure shape described above. Log groups are supplied up front via `logGroups`.
+
+#### Scheduled query observability
+
+The construct exposes no `metric*()` helpers for query health. CloudWatch Logs does emit query-execution metrics
+(`QueryBytesScanned`, `ConcurrencyUsed` in `AWS/Logs`, both currently undocumented), but neither carries a dimension
+identifying a scheduled query — `QueryBytesScanned` has no dimensions at all, so it aggregates every Insights query in
+the account and region. A `metric*()` method hanging off a single alarm would therefore return a figure unrelated to
+that alarm. Per-execution health is available instead from `GetScheduledQueryHistory` (`executionStatus` of
+`Running | InvalidQuery | Complete | Failed | Timeout`) and from the alarm's own `EvaluationState` and `StateReason`.
+
 ### Validation performed at synth
 
 - `comparisonOperator` must be a static-threshold operator (anomaly-detection operators rejected).
-- `queryResultsToEvaluate` / `queryResultsToAlarm` positive integers; `queryResultsToAlarm ≤ queryResultsToEvaluate`.
-- `actionLogLineCount` integer in `[0, 50]`; requires `actionLogLineRole` when `> 0`.
-- `logGroupIdentifiers` (when provided) contains at most 50 entries.
+- `queryResultsToEvaluate` an integer in `[1, 100]`; `queryResultsToAlarm` a positive integer `≤ queryResultsToEvaluate`.
+- `actionLogLineCount` integer in `[0, 50]`; when `> 0` and no `actionLogLineRole` is provided, one is auto-created.
+- `logGroups` (when provided) contains at most 50 entries.
 - `schedule.rate` a whole number of minutes ≥ 1.
 - `schedule.startTimeOffset` between 1 second and 2592000 seconds (30 days).
 - `schedule.endTimeOffset` (when provided) between 0 seconds and 2592000 seconds (30 days).
+- `queryString` between 1 and 10000 characters.
 - `aggregationExpression` at most 2048 characters.
 
 ---
@@ -300,7 +342,7 @@ new cloudwatch.LogAlarm(this, 'ErrorRateAlarm', {
   scheduledQueryConfiguration: {
     queryString: 'fields @message | filter @message like /ERROR/',
     aggregationExpression: 'count(*)',
-    logGroupIdentifiers: [logGroup.logGroupName],
+    logGroups: [logGroup],
     scheduledQueryRole: queryRole,
     schedule: { rate: Duration.minutes(5), startTimeOffset: Duration.minutes(5) },
   },
