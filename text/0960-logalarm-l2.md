@@ -279,34 +279,33 @@ export class LogAlarm extends AlarmBase {
   public readonly scheduledQueryRole: IRole;
   // The log-line role (provided or auto-created when actionLogLineCount > 0); undefined otherwise.
   public readonly actionLogLineRole?: IRole;
+  // Adds a statement to the scheduled query role's policy.
+  public addToRolePolicy(statement: PolicyStatement): void;
   constructor(scope: Construct, id: string, props: LogAlarmProps);
 }
 ```
 
 #### IAM role behaviour
 
-The construct **creates** a role when one is not supplied, and **never modifies a role that the caller supplies**:
+The construct creates a role when one is not supplied, and grants the permissions the feature needs to whichever role
+ends up in use — created or caller-supplied. This follows the Roles section of the CDK Design Guidelines, which expects
+constructs to grant to a provided role, and matches `Function`, `StateMachine`, `Project`, and `DeliveryStream`.
 
-- `scheduledQueryConfiguration.scheduledQueryRole` omitted → a role trusting `logs.amazonaws.com` is created, scoped
-  with `aws:SourceAccount` / `aws:SourceArn` confused-deputy conditions and granted `logs:StartQuery`,
-  `logs:StopQuery`, `logs:GetQueryResults`, and `logs:DescribeLogGroups`.
-- `actionLogLineRole` omitted while `actionLogLineCount > 0` → a role trusting `cloudwatch.amazonaws.com` is created
-  with the same confused-deputy conditions and granted `logs:GetQueryResults`.
-- Either role **supplied** by the caller → used verbatim. The construct adds no trust statements and no permissions to
-  it.
+- **Trust.** A created scheduled-query role trusts `logs.amazonaws.com`, and a created log-line role trusts
+  `cloudwatch.amazonaws.com`; both carry `aws:SourceAccount` / `aws:SourceArn` confused-deputy conditions. Trust is
+  **not** modified on a supplied role, so a supplied role must already trust the right service principal.
+- **Permissions.** The scheduled-query role is granted `logs:StartQuery`, `logs:StopQuery`, `logs:GetQueryResults` and
+  `logs:DescribeLogGroups`; the log-line role is granted `logs:GetQueryResults`. Query permissions are scoped to the
+  ARNs of the log groups in `logGroups`, falling back to every log group in the region when the query selects its log
+  groups inline.
+- **Opting out.** Callers who need an untouched role use the standard CDK escape hatch,
+  `Role.fromRoleArn(..., { mutable: false })`, which turns policy additions into no-ops with a warning.
+- **Extending.** `addToRolePolicy(statement)` adds a statement to the scheduled-query role, and both roles are exposed
+  as public readonly properties.
 
-Not mutating a supplied role is deliberate. Silently broadening a role the customer owns and reviews is surprising, can
-defeat a deliberately narrow scope, and makes the effective permissions of a role invisible in the code that defines it.
-Consistent with the rest of CDK, permissions are added to a caller-supplied role only when the caller asks — both roles
-are exposed as public readonly properties, so `alarm.scheduledQueryRole.addToPrincipalPolicy(...)` and the usual grant
-helpers remain available. The trade-off is that a caller who supplies an under-permissioned role gets a runtime failure
-(the scheduled query reports `executionStatus: Failed`, and the alarm reports `EvaluationState: EVALUATION_ERROR`)
-rather than a synth error; the permissions a supplied role needs are listed above, and the auto-created path is the
-default.
-
-For the same reason the construct does **not** offer an `addLogGroup()` helper: without role mutation it could only
-append to `LogGroupIdentifiers` without granting query access to the added log group, which is precisely the
-silent-failure shape described above. Log groups are supplied up front via `logGroups`.
+The prop type is `IRole` rather than the guidelines' `IRoleRef & IGrantable`: `IRole` already extends `IRoleRef`, and
+`IIdentity → IPrincipal → IGrantable`, so it satisfies both while also providing `addToPrincipalPolicy`. This matches
+`Function.role`.
 
 #### Scheduled query observability
 
